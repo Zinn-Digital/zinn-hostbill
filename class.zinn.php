@@ -95,8 +95,8 @@ class zinn extends HostingModule
             'value' => 'wordpress',
             'type' => 'select',
             'options' => [
-                'headless_cms', 'nextcloud', 'node', 'one_click', 'owncloud',
-                'php', 'static', 'woocommerce', 'wordpress',
+                'dotnet', 'headless_cms', 'nextcloud', 'node', 'one_click', 'owncloud',
+                'php', 'php_app', 'python', 'ruby', 'static', 'woocommerce', 'wordpress',
             ],
         ],
         'application' => [
@@ -309,8 +309,19 @@ class zinn extends HostingModule
             try {
                 $row = $client->get('/v1/reseller/services/' . rawurlencode($site), []);
             } catch (Throwable $e) {
+                // ⛔⛔ ONLY A 404 MEANS GONE (D18633, measured in WHMCS on the same client
+                // code). Catching everything here was right about a 404 and wrong about every
+                // other answer: a transient 502 made the panel report a successful
+                // termination while the site kept running and the wholesale line kept being
+                // invoiced. "I could not ask" is not "there is nothing there", and a
+                // cancellation is the one operation where guessing wrong costs money for ever.
+                if ((int) $e->getCode() !== 404) {
+                    $this->addError($e->getMessage());
+                    return false;
+                }
                 // Gone already, or never ours — nothing left to terminate. Reporting failure
                 // would leave a cancelled account stuck in the panel's queue for ever.
+                $this->setDetail('username', '');
                 return true;
             }
             $domain = trim((string) ($row['primary_domain'] ?? ''));
@@ -322,6 +333,10 @@ class zinn extends HostingModule
                 return false;
             }
             $client->delete('/v1/sites/' . rawurlencode($site), ['confirm_domain' => $domain]);
+            // ⛔ The id goes with the site (D18632): the panel keeps the account row, so
+            // re-activating a returning client presses Create on it — and a dead id left in
+            // place makes create's own "already provisioned" guard fire and provision nothing.
+            $this->setDetail('username', '');
             return true;
         } catch (Throwable $e) {
             $this->addError($e->getMessage());
@@ -403,11 +418,40 @@ class zinn extends HostingModule
     /**
      * The Zinn site id recorded against this account.
      *
+     * ⛔⛔ A SHAPE TEST, NOT `!== ''`, AND THE REASON WAS MEASURED IN WHMCS RATHER THAN HERE
+     * (D18630, 2026-09-02). WHMCS generates its own username into the service row *before*
+     * dispatching create, so an emptiness test reads "already provisioned" on the very first
+     * order, returns success without calling the platform, and the panel marks the account
+     * active with no hosting behind it. HostBill generates account credentials the same way
+     * and this module reads the same `details['username']`, so the identical hole is here —
+     * fixed together because `ClientBehaviourTest` runs the same cases against both files and
+     * a fix applied to one of them is a fix that diverges at the next edit.
+     *
+     * ⚠️ Stated as the WHMCS measurement plus a shared mechanism, NOT as a HostBill
+     * measurement: this lane holds a WHMCS licence and no HostBill install, so the HostBill
+     * half is reasoned, not observed. The fix is correct either way — a UUID test admits
+     * exactly the values the platform issues — but the evidence is one panel, not two.
+     *
      * @return string
      */
     private function zinnSiteId(): string
     {
-        return trim((string) ($this->details['username'] ?? ''));
+        $value = trim((string) ($this->details['username'] ?? ''));
+        return self::isSiteId($value) ? $value : '';
+    }
+
+    /**
+     * Whether a value is a Zinn site id rather than something the panel put there.
+     *
+     * @param string $value Candidate value.
+     * @return bool
+     */
+    public static function isSiteId(string $value): bool
+    {
+        return (bool) preg_match(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i',
+            $value
+        );
     }
 
     /**
