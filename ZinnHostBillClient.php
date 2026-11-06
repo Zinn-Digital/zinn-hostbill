@@ -337,6 +337,7 @@ class ZinnHostBillClient
     private function send(string $method, string $url, ?array $body, string $idempotencyKey): array
     {
         $idempotencyKey = self::idempotencyKeyFor($idempotencyKey, $body);
+        self::requireCurl();
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -350,7 +351,7 @@ class ZinnHostBillClient
         if ($body !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($body));
         }
-        $raw = curl_exec($ch);
+        $raw = curl_exec($ch); // php-fn-guard-ok: requireCurl() above refuses unless canCall('curl_exec').
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $transportError = curl_error($ch);
         curl_close($ch);
@@ -373,5 +374,43 @@ class ZinnHostBillClient
             throw new RuntimeException('Could not reach the hosting platform: ' . $transportError);
         }
         return $this->interpret($status, (string) $raw);
+    }
+
+    /**
+     * Whether this server's PHP lets us call `$fn`: it exists AND it is not in the host's
+     * `disable_functions`.
+     *
+     * ⛔⛔ On PHP 8 a disabled function is UNDEFINED, so calling it is a fatal error that `@`
+     * does not stop (V1 ticket 13692, docs/72 D35246). A billing panel on a hardened host
+     * would show the admin a blank page instead of a reason. PHP 7 keeps a disabled function
+     * "existing", which is why the list is read as well.
+     *
+     * @param string $fn Function name.
+     * @return bool
+     */
+    private static function canCall(string $fn): bool
+    {
+        if (!function_exists($fn)) {
+            return false;
+        }
+        $off = array_map('trim', explode(',', strtolower((string) ini_get('disable_functions'))));
+        return !in_array(strtolower($fn), $off, true);
+    }
+
+    /**
+     * Refuse, with the reason, when this server cannot make an HTTPS call at all. Nothing was
+     * sent, so it is safe to fix the host and press the same button again.
+     *
+     * @return void
+     */
+    private static function requireCurl(): void
+    {
+        if (!self::canCall('curl_init') || !self::canCall('curl_exec')) {
+            throw new RuntimeException(
+                'This server\'s PHP cannot make HTTPS calls: the curl extension is missing or '
+                . 'curl_init/curl_exec is listed in disable_functions, so the request was not sent. '
+                . 'Ask your host to enable curl, then press the same button again.'
+            );
+        }
     }
 }
